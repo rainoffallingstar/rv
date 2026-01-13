@@ -4,6 +4,7 @@ mod cache;
 mod cancellation;
 #[cfg(feature = "cli")]
 pub mod cli;
+mod conda;
 mod config;
 mod configure;
 mod context;
@@ -31,6 +32,7 @@ pub use activate::{activate, deactivate};
 pub use add::{AddOptions, add_packages, read_and_verify_config};
 pub use cache::{CacheInfo, DiskCache, PackagePaths, utils::hash_string};
 pub use cancellation::Cancellation;
+pub use conda::{CondaEnvironment, CondaError, CondaManager, CondaTool};
 pub use config::{Config, ConfigDependency, Repository};
 pub use configure::{
     ConfigureRepositoryResponse, RepositoryAction, RepositoryMatcher, RepositoryOperation,

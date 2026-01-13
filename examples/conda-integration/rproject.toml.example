@@ -1,0 +1,37 @@
+# Example rproject.toml for conda integration
+#
+# This configuration demonstrates how to use rv with conda environments.
+
+[project]
+# Project name
+name = "my-r-project"
+
+# R version to use
+r_version = "4.4.1"
+
+# Conda environment to use for R packages
+# When this is set, rv will use this conda environment for all R operations
+conda_env = "my-project"
+
+# Repositories to use for R packages
+# These are the sources for downloading R packages (NOT for installing R itself)
+[[repositories]]
+alias = "posit"
+url = "https://packagemanager.posit.co/cran/2024-12-16/"
+
+[[repositories]]
+alias = "bioc"
+url = "https://packagemanager.posit.co/bioc/2024-12-16/"
+
+# Dependencies
+dependencies = [
+    "dplyr",
+    "ggplot2",
+    "tidyr",
+    "data.table"
+]
+
+# Development dependencies
+dev_dependencies = [
+    "testthat"
+]

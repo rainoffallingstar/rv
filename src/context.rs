@@ -71,6 +71,8 @@ pub struct Context {
     pub system_dependencies: HashMap<String, Vec<String>>,
     /// Whether to show progress bars/spinners
     pub show_progress_bar: bool,
+    /// Conda environment information (if using conda)
+    pub conda_env: Option<PathBuf>,
 }
 
 impl Context {
@@ -88,12 +90,23 @@ impl Context {
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let config = Config::from_file(config_file)?;
 
+        // Check if we're using a conda environment
+        let conda_env_path = config.conda_env().map(PathBuf::from);
+
         // This can only be set to false if the user passed a r_version to rv plan
         let mut r_version_found = true;
         let (r_version, r_cmd) = match r_command_lookup {
             RCommandLookup::Strict => {
                 let r_version = config.r_version().clone();
-                let r_cmd = find_r_version_command(&r_version)?;
+                let r_cmd = if let Some(ref env_name) = conda_env_path {
+                    // If using conda, set up the conda_env
+                    RCommandLine {
+                        conda_env: Some(env_name.to_string_lossy().to_string()),
+                        r: None,
+                    }
+                } else {
+                    find_r_version_command(&r_version)?
+                };
                 (r_version, r_cmd)
             }
             RCommandLookup::Soft(v) => {
@@ -134,12 +147,28 @@ impl Context {
             None
         };
 
-        let mut library = if let Some(p) = config.library() {
+        // Determine the library path based on config or conda environment
+        let library_path = if let Some(p) = config.library() {
+            Some(p.clone())
+        } else if let Some(ref conda_env) = conda_env_path {
+            // Use the conda environment's R library path
+            let lib_path = PathBuf::from(format!("{}/lib/R/library", conda_env.display()));
+            log::debug!(
+                "Using conda environment library path: {}",
+                lib_path.display()
+            );
+            Some(lib_path)
+        } else {
+            None
+        };
+
+        let mut library = if let Some(p) = library_path {
             Library::new_custom(&project_dir, p)
         } else {
             Library::new(&project_dir, &cache.system_info, r_version.major_minor())
         };
         fs::create_dir_all(&library.path)?;
+        log::debug!("Library path: {}", library.path.display());
         library.find_content();
 
         // We can only fetch the builtin packages if we have the right R
@@ -164,6 +193,7 @@ impl Context {
             builtin_packages,
             system_dependencies: HashMap::new(),
             show_progress_bar: false,
+            conda_env: conda_env_path,
         })
     }
 

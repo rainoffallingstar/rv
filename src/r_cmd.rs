@@ -22,7 +22,7 @@ static R_VERSION_RE: LazyLock<Regex> =
 pub static ACTIVE_R_PROCESS_IDS: LazyLock<Arc<Mutex<HashSet<u32>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashSet::new())));
 
-fn find_r_version(output: &str) -> Option<Version> {
+pub fn find_r_version(output: &str) -> Option<Version> {
     R_VERSION_RE
         .captures(output)
         .and_then(|c| c.get(0))
@@ -40,7 +40,7 @@ pub trait RCmd: Send + Sync {
         destination: impl AsRef<Path>,
         cancellation: Arc<Cancellation>,
         env_vars: &HashMap<&str, &str>,
-        configure_args: &[String],
+        _configure_args: &[String],
     ) -> Result<String, InstallError>;
 
     fn get_r_library(&self) -> Result<PathBuf, LibraryError>;
@@ -53,7 +53,12 @@ pub trait RCmd: Send + Sync {
 /// so we can control _how_ they get killed, and allow for a soft cancellation (eg we let
 /// ongoing tasks finish but stop enqueuing/processing new ones.
 fn spawn_isolated_r_command(r_cmd: &RCommandLine) -> Command {
-    let mut command = Command::new(r_cmd.effective_r_command());
+    let (cmd, args) = r_cmd.effective_command();
+    let mut command = Command::new(cmd);
+
+    if !args.is_empty() {
+        command.args(&args);
+    }
 
     #[cfg(unix)]
     {
@@ -99,10 +104,12 @@ pub fn kill_all_r_processes() {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RCommandLine {
     /// specifies the path to the R executable on the system. None indicates using "R" on the $PATH
     pub r: Option<PathBuf>,
+    /// specifies the conda environment to use. If set, R will be run within this conda environment
+    pub conda_env: Option<String>,
 }
 
 pub fn find_r_version_command(r_version: &Version) -> Result<RCommandLine, VersionError> {
@@ -110,10 +117,18 @@ pub fn find_r_version_command(r_version: &Version) -> Result<RCommandLine, Versi
 
     let mut found_r_vers = Vec::new();
     // Give preference to the R version on the path
-    if let Ok(path_r) = (RCommandLine { r: None }).version() {
+    if let Ok(path_r) = (RCommandLine {
+        r: None,
+        conda_env: None,
+    })
+    .version()
+    {
         if r_version.hazy_match(&path_r) {
             log::debug!("R found on the path: {path_r}");
-            return Ok(RCommandLine { r: None });
+            return Ok(RCommandLine {
+                r: None,
+                conda_env: None,
+            });
         }
         found_r_vers.push(path_r.original);
     }
@@ -129,6 +144,7 @@ pub fn find_r_version_command(r_version: &Version) -> Result<RCommandLine, Versi
 
             let rig_r_cmd = RCommandLine {
                 r: Some(rig_r_bin_path),
+                conda_env: None,
             };
 
             if let Ok(path_rig_r) = rig_r_cmd.version() {
@@ -148,6 +164,7 @@ pub fn find_r_version_command(r_version: &Version) -> Result<RCommandLine, Versi
     if cfg!(target_os = "windows") {
         let rig_r_cmd = RCommandLine {
             r: Some(PathBuf::from("R.bat")),
+            conda_env: None,
         };
 
         if let Ok(rig_r) = rig_r_cmd.version() {
@@ -177,6 +194,7 @@ pub fn find_r_version_command(r_version: &Version) -> Result<RCommandLine, Versi
             {
                 let r_cmd = RCommandLine {
                     r: Some(path.clone()),
+                    conda_env: None,
                 };
                 if let Ok(ver) = r_cmd.version() {
                     if r_version.hazy_match(&ver) {
@@ -225,6 +243,28 @@ impl RCommandLine {
             PathBuf::from("R")
         }
     }
+
+    /// Get the command to execute R, potentially using conda run
+    fn effective_command(&self) -> (String, Vec<String>) {
+        if let Some(ref conda_env) = self.conda_env {
+            // Use conda run to execute R in the specified environment
+            (
+                "conda".to_string(),
+                vec![
+                    "run".to_string(),
+                    "-n".to_string(),
+                    conda_env.clone(),
+                    "R".to_string(),
+                ],
+            )
+        } else {
+            // Use R directly
+            (
+                self.effective_r_command().to_string_lossy().to_string(),
+                vec![],
+            )
+        }
+    }
 }
 
 impl RCmd for RCommandLine {
@@ -236,7 +276,7 @@ impl RCmd for RCommandLine {
         destination: impl AsRef<Path>,
         cancellation: Arc<Cancellation>,
         env_vars: &HashMap<&str, &str>,
-        configure_args: &[String],
+        _configure_args: &[String],
     ) -> Result<String, InstallError> {
         let destination = destination.as_ref();
         // We create a temp build dir so we only remove an existing destination if we have something we can replace it with

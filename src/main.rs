@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use fs_err::{read_to_string, write};
 use serde_json::json;
+use toml;
 
 use anyhow::anyhow;
 use rv::cli::{
@@ -12,7 +13,7 @@ use rv::cli::{
     init_structure, migrate_renv, resolve_dependencies, tree,
 };
 use rv::system_req::{SysDep, SysInstallationStatus};
-use rv::{AddOptions, RepositoryOperation as LibRepositoryOperation};
+use rv::{AddOptions, CondaManager, RepositoryOperation as LibRepositoryOperation};
 use rv::{
     CacheInfo, Config, ProjectSummary, RCmd, RCommandLine, RepositoryAction, RepositoryMatcher,
     RepositoryPositioning, RepositoryUpdates, Version, activate, add_packages, deactivate,
@@ -69,6 +70,12 @@ pub enum Command {
     Sync {
         #[clap(long)]
         save_install_logs_in: Option<PathBuf>,
+        #[clap(long)]
+        /// Use specified conda environment
+        condaenv: Option<String>,
+        #[clap(long)]
+        /// Auto-create conda environment if it doesn't exist
+        auto_create: bool,
     },
     /// Add packages to the project and sync
     Add {
@@ -299,12 +306,18 @@ fn try_main() -> Result<()> {
                 r.original
             } else {
                 // if R version is not provided, get the major.minor of the R version on the path
-                let [major, minor] = match (RCommandLine { r: None }).version() {
+                let [major, minor] = match (RCommandLine {
+                    r: None,
+                    conda_env: None,
+                })
+                .version()
+                {
                     Ok(r_ver) => r_ver,
                     Err(e) => {
                         if cfg!(windows) {
                             RCommandLine {
                                 r: Some(PathBuf::from("R.bat")),
+                                conda_env: None,
                             }
                             .version()?
                         } else {
@@ -407,7 +420,62 @@ fn try_main() -> Result<()> {
         }
         Command::Sync {
             save_install_logs_in,
+            condaenv,
+            auto_create,
         } => {
+            // Handle conda environment if specified
+            if let Some(ref env_name) = condaenv {
+                let mut config = rv::Config::from_file(&cli.config_file).map_err(|e| {
+                    eprintln!("Error loading config: {}", e);
+                    eprintln!("Error details: {:?}", e);
+                    anyhow!("Failed to load config: {e}")
+                })?;
+
+                // Set conda environment in config
+                config.set_conda_env(env_name.clone());
+
+                // Try to detect conda tool and check if environment exists
+                let conda_manager = CondaManager::new()
+                    .map_err(|e| anyhow!("Failed to initialize conda manager: {e}"))?;
+
+                if conda_manager.environment_exists(env_name) {
+                    println!("✓ Conda environment '{}' found", env_name);
+
+                    // Get the environment info to set library path
+                    if let Ok(env) = conda_manager.get_environment(env_name) {
+                        config.set_library(env.r_lib.clone());
+                    }
+                } else if auto_create {
+                    println!(
+                        "ℹ️  Conda environment '{}' not found, creating...",
+                        env_name
+                    );
+                    let r_version = config.r_version().clone();
+                    let env = conda_manager
+                        .create_environment(env_name, &r_version)
+                        .map_err(|e| anyhow!("Failed to create conda environment: {e}"))?;
+                    println!("✓ Conda environment '{}' created successfully", env_name);
+                    config.set_library(env.r_lib.clone());
+                } else {
+                    return Err(anyhow!(
+                        "Conda environment '{}' not found. Use --auto-create to create it.",
+                        env_name
+                    ));
+                }
+
+                // Save the updated config with both conda_env and library
+                log::debug!(
+                    "Config library field before serialization: {:?}",
+                    config.library()
+                );
+                let config_content = toml::to_string_pretty(&config)
+                    .map_err(|e| anyhow!("Failed to serialize config: {e}"))?;
+                log::debug!("Serialized config:\n{}", config_content);
+                fs_err::write(&cli.config_file, config_content)
+                    .map_err(|e| anyhow!("Failed to write config: {e}"))?;
+            }
+
+            // Create Context (will use the updated config with library path)
             let mut context = Context::new(&cli.config_file, RCommandLookup::Strict)
                 .map_err(|e| anyhow!("{e}"))?;
 

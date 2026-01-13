@@ -321,6 +321,7 @@ pub(crate) struct Project {
     authors: Vec<Author>,
     #[serde(default)]
     keywords: Vec<String>,
+    #[serde(default)]
     repositories: Vec<Repository>,
     #[serde(default)]
     suggests: Vec<ConfigDependency>,
@@ -349,6 +350,9 @@ pub(crate) struct Project {
     /// Package-specific configure.args with system targeting
     #[serde(default)]
     pub configure_args: HashMap<String, Vec<ConfigureArgsRule>>,
+    /// Conda environment to use for R package installation
+    #[serde(default)]
+    conda_env: Option<String>,
 }
 
 // That's the way to do it with serde :/
@@ -360,6 +364,7 @@ fn default_true() -> bool {
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) library: Option<PathBuf>,
     #[serde(default = "default_true")]
     pub(crate) use_lockfile: bool,
@@ -369,16 +374,22 @@ pub struct Config {
 
 impl Config {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigLoadError> {
-        let content = match std::fs::read_to_string(path.as_ref()) {
+        let path = path.as_ref().to_path_buf();
+        let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
                 return Err(ConfigLoadError {
-                    path: path.as_ref().into(),
+                    path: path.into(),
                     source: ConfigLoadErrorKind::Io(e),
                 });
             }
         };
-        Self::from_str(&content)
+        let mut config: Self = toml::from_str(&content).map_err(|e| ConfigLoadError {
+            path: path.into(),
+            source: ConfigLoadErrorKind::Parse(e),
+        })?;
+        config.finalize()?;
+        Ok(config)
     }
 
     /// This will do 2 things:
@@ -434,9 +445,11 @@ impl Config {
         }
 
         if !errors.is_empty() {
+            let error_msg = errors.join("\n");
+            log::error!("Config validation errors: {}", error_msg);
             return Err(ConfigLoadError {
                 path: Path::new(".").into(),
-                source: ConfigLoadErrorKind::InvalidConfig(errors.join("\n")),
+                source: ConfigLoadErrorKind::InvalidConfig(error_msg),
             });
         }
 
@@ -502,6 +515,14 @@ impl Config {
 
     pub fn configure_args(&self) -> &HashMap<String, Vec<ConfigureArgsRule>> {
         &self.project.configure_args
+    }
+
+    pub fn conda_env(&self) -> Option<&str> {
+        self.project.conda_env.as_deref()
+    }
+
+    pub fn set_conda_env(&mut self, conda_env: String) {
+        self.project.conda_env = Some(conda_env);
     }
 }
 

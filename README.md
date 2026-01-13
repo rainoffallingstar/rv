@@ -41,6 +41,48 @@ dependencies = [
 ]
 ```
 
+### Using with Conda Environments
+
+rv can integrate seamlessly with conda/mamba/micromamba environments. This allows you to use conda-managed R installations while letting rv handle R package management.
+
+#### Quick Start with Conda
+
+```bash
+# Use an existing conda environment
+rv sync --condaenv myenv
+
+# Or auto-create a new environment with --auto-create
+rv sync --condaenv myproject-env --auto-create
+```
+
+#### Configuration File Example
+
+You can also specify the conda environment in your `rproject.toml`:
+
+```toml
+[project]
+name = "my conda project"
+r_version = "4.4.1"
+conda_env = "my-project-env"
+
+repositories = [
+    { alias = "PPM", url = "https://packagemanager.posit.co/cran/latest" },
+]
+
+dependencies = [
+    "dplyr",
+    "ggplot2",
+    "tidyr"
+]
+```
+
+When using a conda environment, rv will:
+- Install packages directly to the conda environment's R library (`{conda_env}/lib/R/library`)
+- Use the conda-managed R installation
+- Save the environment and library path to your configuration for future use
+
+This approach combines the best of both worlds: conda for R runtime management and rv for reproducible R package management.
+
 Running `rv sync` will synchronize the library, lock file, and configuration file by installing `dplyr`, `ggplot2`, any dependencies those packages require, and the suggested packages for `ggplot2`. Running `rv plan` will give you a preview of what `rv sync` will do.
 
 Additional example projects with more configurations can be found in the [example_projects](example_projects)  directory of this repository.
