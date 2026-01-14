@@ -159,10 +159,14 @@ impl CondaManager {
         let r_version = self.get_r_version_from_environment(&prefix, tool)?;
         let r_lib = prefix.join("lib/R/library");
 
+        // Find the full path to the conda executable
+        let conda_path = which(tool.command()).ok();
+
         // Create RCommandLine for this environment
         let r_cmd = RCommandLine {
             r: None,
             conda_env: Some(name.to_string()),
+            conda_path,
         };
 
         Ok(CondaEnvironment {
@@ -285,9 +289,11 @@ impl CondaManager {
                                         .unwrap_or(false)
                                     {
                                         let r_lib = path_buf.join("lib/R/library");
+                                        let conda_path = which(tool.command()).ok();
                                         let r_cmd = RCommandLine {
                                             r: None,
                                             conda_env: Some(name.to_string()),
+                                            conda_path,
                                         };
                                         return Ok(CondaEnvironment {
                                             name: name.to_string(),
@@ -396,6 +402,86 @@ impl CondaManager {
         }
 
         Ok(names)
+    }
+
+    /// 在指定环境中安装包
+    pub fn install_packages(
+        &self,
+        env_name: &str,
+        packages: &[String],
+        channels: Option<Vec<String>>,
+    ) -> Result<(), CondaError> {
+        let tool = self.tool.as_ref().ok_or(CondaError::ToolNotFound)?;
+
+        log::info!(
+            "Installing {} packages in conda environment '{}': {:?}",
+            packages.len(),
+            env_name,
+            packages
+        );
+
+        let mut cmd = Command::new(tool.command());
+        cmd.args(&["install", "-n", env_name, "-y"]);
+
+        // 添加频道
+        if let Some(chs) = channels {
+            for ch in chs {
+                cmd.args(&["-c", &ch]);
+            }
+        } else {
+            // 默认使用 conda-forge
+            cmd.args(&["-c", "conda-forge"]);
+        }
+
+        // 添加包名
+        for pkg in packages {
+            cmd.arg(pkg);
+        }
+
+        let output = cmd.output().map_err(|e| CondaError::Io(e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::error!("Failed to install conda packages: {}", stderr);
+            return Err(CondaError::CreateFailed(stderr.to_string()));
+        }
+
+        log::info!("Successfully installed conda packages: {:?}", packages);
+        Ok(())
+    }
+
+    /// 检查包是否在环境中已安装
+    pub fn is_package_installed(
+        &self,
+        env_name: &str,
+        package: &str,
+    ) -> Result<bool, CondaError> {
+        let tool = self.tool.as_ref().ok_or(CondaError::ToolNotFound)?;
+
+        let output = Command::new(tool.command())
+            .args(&["list", "--json", "-n", env_name])
+            .output()
+            .map_err(|e| CondaError::Io(e))?;
+
+        if !output.status.success() {
+            return Ok(false);
+        }
+
+        let list: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+                .map_err(|e| CondaError::Json(e))?;
+
+        if let Some(packages) = list["packages"].as_array() {
+            for pkg in packages {
+                if let Some(name) = pkg["name"].as_str() {
+                    if name == package {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
     }
 }
 

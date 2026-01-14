@@ -6,14 +6,16 @@ use anyhow::Result;
 use fs_err::{read_to_string, write};
 use serde_json::json;
 use toml;
+use url::Url;
 
 use anyhow::anyhow;
 use rv::cli::{
     Context, OutputFormat, RCommandLookup, ResolveMode, SyncHelper, find_r_repositories, init,
     init_structure, migrate_renv, resolve_dependencies, tree,
 };
+use rv::extract_packages_from_directory;
 use rv::system_req::{SysDep, SysInstallationStatus};
-use rv::{AddOptions, CondaManager, RepositoryOperation as LibRepositoryOperation};
+use rv::{AddOptions, CondaManager, Repository, RepositoryOperation as LibRepositoryOperation};
 use rv::{
     CacheInfo, Config, ProjectSummary, RCmd, RCommandLine, RepositoryAction, RepositoryMatcher,
     RepositoryPositioning, RepositoryUpdates, Version, activate, add_packages, deactivate,
@@ -60,6 +62,9 @@ pub enum Command {
         #[clap(long)]
         /// Force new init. This will replace content in your rproject.toml
         force: bool,
+        #[clap(long)]
+        /// Use specified conda environment
+        condaenv: Option<String>,
     },
     /// Migrate renv to rv
     Migrate {
@@ -174,6 +179,14 @@ pub enum Command {
         /// and want to not return it from this command.
         #[clap(long)]
         ignore: Vec<String>,
+
+        /// Attempt to install missing dependencies via conda (if conda_env is set in rproject.toml)
+        #[clap(long)]
+        install: bool,
+
+        /// Show what would be installed without actually installing
+        #[clap(long)]
+        dry_run: bool,
     },
     /// Activate a previously initialized rv project
     Activate {
@@ -301,6 +314,7 @@ fn try_main() -> Result<()> {
             add,
             no_r_environment,
             force,
+            condaenv,
         } => {
             let r_version = if let Some(r) = r_version {
                 r.original
@@ -309,6 +323,7 @@ fn try_main() -> Result<()> {
                 let [major, minor] = match (RCommandLine {
                     r: None,
                     conda_env: None,
+                    conda_path: None,
                 })
                 .version()
                 {
@@ -318,6 +333,7 @@ fn try_main() -> Result<()> {
                             RCommandLine {
                                 r: Some(PathBuf::from("R.bat")),
                                 conda_env: None,
+                                conda_path: None,
                             }
                             .version()?
                         } else {
@@ -329,21 +345,46 @@ fn try_main() -> Result<()> {
                 format!("{major}.{minor}")
             };
 
+            // Default to PPM repositories unless --no-repositories is specified
             let repositories = if no_repositories {
                 Vec::new()
             } else {
-                match find_r_repositories() {
-                    Ok(repos) if !repos.is_empty() => repos,
-                    _ => {
-                        eprintln!(
-                            "WARNING: Could not set default repositories. Set with your company preferred package URL or public url (i.e. `https://packagemanager.posit.co/cran/latest`)\n"
-                        );
-                        Vec::new()
-                    }
+                vec![
+                    Repository::new(
+                        "posit".to_string(),
+                        Url::parse("https://packagemanager.posit.co/cran/latest").unwrap(),
+                        false,
+                    ),
+                    Repository::new(
+                        "bioc".to_string(),
+                        Url::parse("https://packagemanager.posit.co/bioc/latest").unwrap(),
+                        false,
+                    ),
+                ]
+            };
+
+            // Extract packages from R files
+            let mut extracted_packages = match extract_packages_from_directory(&project_directory) {
+                Ok(pkgs) => pkgs.into_iter().collect::<Vec<_>>(),
+                Err(e) => {
+                    eprintln!("Warning: Failed to scan R files: {}. Continuing without extracted packages.", e);
+                    Vec::new()
                 }
             };
 
-            init(&project_directory, &r_version, &repositories, &add, force)?;
+            // Merge with packages from --add flag
+            extracted_packages.extend(add);
+            extracted_packages.sort();
+            extracted_packages.dedup();
+
+            init(
+                &project_directory,
+                &r_version,
+                &repositories,
+                &extracted_packages,
+                condaenv.as_deref(),
+                force,
+            )?;
             activate(&project_directory, no_r_environment)?;
 
             if output_format.is_json() {
@@ -366,7 +407,11 @@ fn try_main() -> Result<()> {
                     no_r_environment,
                 },
         } => {
-            let unresolved = migrate_renv(&renv_file, &cli.config_file, strict_r_version)?;
+            // Create Context to support conda_env integration
+            let context = Context::new(&cli.config_file, RCommandLookup::Strict)
+                .map_err(|e| anyhow!("{e}"))?;
+
+            let unresolved = migrate_renv(&renv_file, &cli.config_file, strict_r_version, &context)?;
             // migrate renv will create the config file, so parent directory is confirmed to exist
             let project_dir = &cli
                 .config_file
@@ -423,39 +468,29 @@ fn try_main() -> Result<()> {
             condaenv,
             auto_create,
         } => {
-            // Handle conda environment if specified
+            // Simplified: Handle conda environment for sync
             if let Some(ref env_name) = condaenv {
-                let mut config = rv::Config::from_file(&cli.config_file).map_err(|e| {
-                    eprintln!("Error loading config: {}", e);
-                    eprintln!("Error details: {:?}", e);
-                    anyhow!("Failed to load config: {e}")
-                })?;
-
-                // Set conda environment in config
-                config.set_conda_env(env_name.clone());
-
                 // Try to detect conda tool and check if environment exists
                 let conda_manager = CondaManager::new()
                     .map_err(|e| anyhow!("Failed to initialize conda manager: {e}"))?;
 
                 if conda_manager.environment_exists(env_name) {
                     println!("✓ Conda environment '{}' found", env_name);
-
-                    // Get the environment info to set library path
-                    if let Ok(env) = conda_manager.get_environment(env_name) {
-                        config.set_library(env.r_lib.clone());
-                    }
                 } else if auto_create {
                     println!(
                         "ℹ️  Conda environment '{}' not found, creating...",
                         env_name
                     );
+                    // Load config to get R version for environment creation
+                    let config = rv::Config::from_file(&cli.config_file).map_err(|e| {
+                        eprintln!("Error loading config: {}", e);
+                        anyhow!("Failed to load config: {e}")
+                    })?;
                     let r_version = config.r_version().clone();
-                    let env = conda_manager
+                    let _env = conda_manager
                         .create_environment(env_name, &r_version)
                         .map_err(|e| anyhow!("Failed to create conda environment: {e}"))?;
                     println!("✓ Conda environment '{}' created successfully", env_name);
-                    config.set_library(env.r_lib.clone());
                 } else {
                     return Err(anyhow!(
                         "Conda environment '{}' not found. Use --auto-create to create it.",
@@ -463,19 +498,19 @@ fn try_main() -> Result<()> {
                     ));
                 }
 
-                // Save the updated config with both conda_env and library
-                log::debug!(
-                    "Config library field before serialization: {:?}",
-                    config.library()
-                );
+                // Update config file to persist conda_env setting
+                let mut config = rv::Config::from_file(&cli.config_file).map_err(|e| {
+                    eprintln!("Error loading config: {}", e);
+                    anyhow!("Failed to load config: {e}")
+                })?;
+                config.set_conda_env(env_name.clone());
                 let config_content = toml::to_string_pretty(&config)
                     .map_err(|e| anyhow!("Failed to serialize config: {e}"))?;
-                log::debug!("Serialized config:\n{}", config_content);
                 fs_err::write(&cli.config_file, config_content)
                     .map_err(|e| anyhow!("Failed to write config: {e}"))?;
             }
 
-            // Create Context (will use the updated config with library path)
+            // Create Context (will automatically use conda_env from config if set)
             let mut context = Context::new(&cli.config_file, RCommandLookup::Strict)
                 .map_err(|e| anyhow!("{e}"))?;
 
@@ -721,9 +756,16 @@ fn try_main() -> Result<()> {
             };
 
             if output_format.is_json() {
-                println!("{}", json!({"directory": path_out}));
+                let mut output = json!({"directory": path_out});
+                if let Some(ref conda_env) = context.conda_env {
+                    output["conda_env"] = json!(conda_env.display().to_string());
+                }
+                println!("{}", output);
             } else {
                 println!("{path_out}");
+                if let Some(ref conda_env) = context.conda_env {
+                    println!("Conda Environment: {}", conda_env.display());
+                }
             }
         }
         Command::Cache => {
@@ -739,12 +781,21 @@ fn try_main() -> Result<()> {
                 resolve_dependencies(&context, ResolveMode::Default, true).found,
             );
             if output_format.is_json() {
+                let mut info_json = serde_json::to_value(&info).expect("valid json");
+                if let Some(ref conda_env) = context.conda_env {
+                    info_json["conda_env"] = json!(conda_env.display().to_string());
+                    info_json["library"] = json!(context.library_path().display().to_string());
+                }
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&info).expect("valid json")
+                    serde_json::to_string_pretty(&info_json).expect("valid json")
                 );
             } else {
                 println!("{info}");
+                if let Some(ref conda_env) = context.conda_env {
+                    println!("Conda Environment: {}", conda_env.display());
+                    println!("R Library: {}", context.library_path().display());
+                }
             }
         }
         Command::Info {
@@ -764,6 +815,13 @@ fn try_main() -> Result<()> {
                     path_str.to_string()
                 };
                 output.push(("library", path_out));
+                // Add library type (Conda vs System)
+                if let Some(ref conda_env) = context.conda_env {
+                    output.push(("library-type", "Conda".to_string()));
+                    output.push(("conda-env", conda_env.display().to_string()));
+                } else {
+                    output.push(("library-type", "System".to_string()));
+                }
             }
             if r_version {
                 output.push(("r-version", context.r_version.original.to_owned()));
@@ -791,6 +849,8 @@ fn try_main() -> Result<()> {
         Command::Sysdeps {
             only_absent,
             ignore,
+            install,
+            dry_run,
         } => {
             let mut context =
                 Context::new(&cli.config_file, RCommandLookup::Skip).map_err(|e| anyhow!("{e}"))?;
@@ -814,6 +874,11 @@ fn try_main() -> Result<()> {
                 &context.cache.system_info,
                 &project_sys_deps,
             );
+
+            // 如果指定了 --install，尝试安装缺失的依赖
+            if install {
+                install_conda_sysdeps(&context, &sys_deps_status, dry_run)?;
+            }
 
             let mut sys_deps_names: Vec<_> = sys_deps_status
                 .into_iter()
@@ -1011,6 +1076,114 @@ fn try_main() -> Result<()> {
                 }
             }
         }
+    }
+
+    Ok(())
+}
+
+/// 安装系统依赖通过 conda
+fn install_conda_sysdeps(
+    context: &Context,
+    sys_deps_status: &HashMap<String, SysInstallationStatus>,
+    dry_run: bool,
+) -> Result<()> {
+    use crate::system_req::{classify_dependency, DependencyInstallability};
+
+    // 筛选缺失的依赖
+    let missing: Vec<_> = sys_deps_status
+        .iter()
+        .filter(|(_, status)| **status == SysInstallationStatus::Absent)
+        .map(|(pkg, _)| pkg.clone())
+        .collect();
+
+    if missing.is_empty() {
+        println!("✓ All system dependencies are satisfied");
+        return Ok(());
+    }
+
+    // 检查是否配置了 conda 环境
+    let conda_env = context
+        .conda_env
+        .as_ref()
+        .ok_or_else(|| anyhow!("--install flag requires conda_env to be set in rproject.toml\nAdd: conda_env = \"your-env-name\" in [project] section"))?;
+
+    println!("⚠️  Missing system dependencies detected:");
+    for pkg in &missing {
+        println!("   - {}", pkg);
+    }
+
+    // 分类依赖
+    let mut conda_installable = Vec::new();
+    let mut manual_required = Vec::new();
+
+    for pkg in &missing {
+        match classify_dependency(pkg, true) {
+            DependencyInstallability::CondaInstallable(conda_pkg) => {
+                conda_installable.push(conda_pkg);
+            }
+            DependencyInstallability::ManualRequired => {
+                manual_required.push(pkg.clone());
+            }
+            _ => {
+                manual_required.push(pkg.clone());
+            }
+        }
+    }
+
+    // 显示分类结果
+    if !conda_installable.is_empty() {
+        println!("\n✓ Can be installed via conda:");
+        for pkg in &conda_installable {
+            println!("   - {}", pkg);
+        }
+    }
+
+    if !manual_required.is_empty() {
+        println!("\n⚠️  Require manual installation:");
+        for pkg in &manual_required {
+            println!("   - {}", pkg);
+        }
+
+        // 给出安装建议
+        let system_info = &context.cache.system_info;
+        let (distrib, _) = system_info.sysreq_data();
+        match distrib {
+            "ubuntu" | "debian" => {
+                println!("\n   Install them using:");
+                println!("   sudo apt-get install -y {}\n", manual_required.join(" "));
+            }
+            "centos" | "redhat" | "rockylinux" => {
+                println!("\n   Install them using:");
+                println!("   sudo yum install -y {}\n", manual_required.join(" "));
+            }
+            _ => {
+                println!("\n   Please install them manually using your system package manager\n");
+            }
+        }
+    }
+
+    // 如果是 dry_run，不实际安装
+    if dry_run {
+        println!("\n[DRY RUN] Would install {} conda packages", conda_installable.len());
+        return Ok(());
+    }
+
+    // 安装可通过 conda 安装的包
+    if !conda_installable.is_empty() {
+        println!("\n📦 Installing {} conda packages...", conda_installable.len());
+
+        let conda_manager = CondaManager::new()
+            .map_err(|e| anyhow!("Failed to initialize conda manager: {}", e))?;
+
+        conda_manager
+            .install_packages(
+                conda_env.to_str().unwrap(),
+                &conda_installable,
+                None, // 使用默认频道 conda-forge
+            )
+            .map_err(|e| anyhow!("Failed to install conda packages: {}", e))?;
+
+        println!("✓ Successfully installed {} conda packages", conda_installable.len());
     }
 
     Ok(())

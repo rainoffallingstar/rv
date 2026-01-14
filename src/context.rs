@@ -1,6 +1,7 @@
 //! Project context for rv library usage
 
 use std::collections::HashMap;
+use std::env;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +19,59 @@ use crate::{
     Resolution, Resolver, SystemInfo, Version, find_r_version_command, get_package_file_urls, http,
     system_req,
 };
+
+/// Try to find the conda executable using multiple methods
+fn find_conda_executable() -> Option<PathBuf> {
+    // First, check environment variables
+    if let Ok(conda_exe) = env::var("CONDA_EXE") {
+        let path = PathBuf::from(&conda_exe);
+        if path.exists() {
+            log::debug!("Found conda via CONDA_EXE: {}", path.display());
+            return Some(path);
+        }
+    }
+
+    // Second, try which() for common conda commands
+    if let Ok(path) = which::which("conda") {
+        log::debug!("Found conda via which: {}", path.display());
+        return Some(path);
+    }
+    if let Ok(path) = which::which("mamba") {
+        log::debug!("Found mamba via which: {}", path.display());
+        return Some(path);
+    }
+    if let Ok(path) = which::which("micromamba") {
+        log::debug!("Found micromamba via which: {}", path.display());
+        return Some(path);
+    }
+
+    // Third, check common installation locations
+    let home = env::var("HOME").ok()?;
+    let common_locations = vec![
+        // Miniconda
+        format!("{}/miniconda3/condabin/conda", home),
+        format!("{}/miniconda3/bin/conda", home),
+        // Anaconda
+        format!("{}/anaconda3/condabin/conda", home),
+        format!("{}/anaconda3/bin/conda", home),
+        // Miniforge
+        format!("{}/miniforge3/condabin/conda", home),
+        format!("{}/miniforge3/bin/conda", home),
+        // Micromamba
+        format!("{}/micromamba/bin/micromamba", home),
+    ];
+
+    for location in common_locations {
+        let path = PathBuf::from(&location);
+        if path.exists() {
+            log::debug!("Found conda in common location: {}", path.display());
+            return Some(path);
+        }
+    }
+
+    log::debug!("Could not find conda executable");
+    None
+}
 
 /// Method on how to find the R Version on the system
 #[derive(Debug, Clone, PartialEq)]
@@ -100,9 +154,12 @@ impl Context {
                 let r_version = config.r_version().clone();
                 let r_cmd = if let Some(ref env_name) = conda_env_path {
                     // If using conda, set up the conda_env
+                    // Try to find conda executable path using multiple methods
+                    let conda_path = find_conda_executable();
                     RCommandLine {
                         conda_env: Some(env_name.to_string_lossy().to_string()),
                         r: None,
+                        conda_path,
                     }
                 } else {
                     find_r_version_command(&r_version)?
@@ -119,7 +176,24 @@ impl Context {
                 };
                 (v, r_cmd)
             }
-            RCommandLookup::Skip => (config.r_version().clone(), RCommandLine::default()),
+            RCommandLookup::Skip => {
+                // Even when skipping R command lookup, we still need to respect conda_env configuration
+                let r_version = config.r_version().clone();
+                let r_cmd = if let Some(ref env_name) = conda_env_path {
+                    // If using conda, set up the conda_env even for Skip mode
+                    let conda_path = find_conda_executable();
+                    RCommandLine {
+                        conda_env: Some(env_name.to_string_lossy().to_string()),
+                        r: None,
+                        conda_path,
+                    }
+                } else {
+                    // Without conda, we can't find R version in Skip mode
+                    r_version_found = false;
+                    RCommandLine::default()
+                };
+                (r_version, r_cmd)
+            }
         };
 
         let cache = if let Some(dir) = cache_dir {

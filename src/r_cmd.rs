@@ -40,7 +40,7 @@ pub trait RCmd: Send + Sync {
         destination: impl AsRef<Path>,
         cancellation: Arc<Cancellation>,
         env_vars: &HashMap<&str, &str>,
-        _configure_args: &[String],
+        configure_args: &[String],
     ) -> Result<String, InstallError>;
 
     fn get_r_library(&self) -> Result<PathBuf, LibraryError>;
@@ -110,6 +110,8 @@ pub struct RCommandLine {
     pub r: Option<PathBuf>,
     /// specifies the conda environment to use. If set, R will be run within this conda environment
     pub conda_env: Option<String>,
+    /// specifies the path to the conda executable. None indicates using "conda" on the $PATH
+    pub conda_path: Option<PathBuf>,
 }
 
 pub fn find_r_version_command(r_version: &Version) -> Result<RCommandLine, VersionError> {
@@ -120,6 +122,7 @@ pub fn find_r_version_command(r_version: &Version) -> Result<RCommandLine, Versi
     if let Ok(path_r) = (RCommandLine {
         r: None,
         conda_env: None,
+        conda_path: None,
     })
     .version()
     {
@@ -128,6 +131,7 @@ pub fn find_r_version_command(r_version: &Version) -> Result<RCommandLine, Versi
             return Ok(RCommandLine {
                 r: None,
                 conda_env: None,
+                conda_path: None,
             });
         }
         found_r_vers.push(path_r.original);
@@ -145,6 +149,7 @@ pub fn find_r_version_command(r_version: &Version) -> Result<RCommandLine, Versi
             let rig_r_cmd = RCommandLine {
                 r: Some(rig_r_bin_path),
                 conda_env: None,
+                conda_path: None,
             };
 
             if let Ok(path_rig_r) = rig_r_cmd.version() {
@@ -165,6 +170,7 @@ pub fn find_r_version_command(r_version: &Version) -> Result<RCommandLine, Versi
         let rig_r_cmd = RCommandLine {
             r: Some(PathBuf::from("R.bat")),
             conda_env: None,
+            conda_path: None,
         };
 
         if let Ok(rig_r) = rig_r_cmd.version() {
@@ -195,6 +201,7 @@ pub fn find_r_version_command(r_version: &Version) -> Result<RCommandLine, Versi
                 let r_cmd = RCommandLine {
                     r: Some(path.clone()),
                     conda_env: None,
+                    conda_path: None,
                 };
                 if let Ok(ver) = r_cmd.version() {
                     if r_version.hazy_match(&ver) {
@@ -248,8 +255,16 @@ impl RCommandLine {
     fn effective_command(&self) -> (String, Vec<String>) {
         if let Some(ref conda_env) = self.conda_env {
             // Use conda run to execute R in the specified environment
+            let conda_cmd = if let Some(ref path) = self.conda_path {
+                log::debug!("Using conda_path: {}", path.display());
+                path.to_string_lossy().to_string()
+            } else {
+                log::debug!("No conda_path set, falling back to 'conda' command");
+                "conda".to_string()
+            };
+            log::debug!("effective_command: {} run -n {} R", conda_cmd, conda_env);
             (
-                "conda".to_string(),
+                conda_cmd,
                 vec![
                     "run".to_string(),
                     "-n".to_string(),
@@ -259,10 +274,9 @@ impl RCommandLine {
             )
         } else {
             // Use R directly
-            (
-                self.effective_r_command().to_string_lossy().to_string(),
-                vec![],
-            )
+            let r_cmd = self.effective_r_command().to_string_lossy().to_string();
+            log::debug!("effective_command: {}", r_cmd);
+            (r_cmd, vec![])
         }
     }
 }
@@ -276,7 +290,7 @@ impl RCmd for RCommandLine {
         destination: impl AsRef<Path>,
         cancellation: Arc<Cancellation>,
         env_vars: &HashMap<&str, &str>,
-        _configure_args: &[String],
+        configure_args: &[String],
     ) -> Result<String, InstallError> {
         let destination = destination.as_ref();
         // We create a temp build dir so we only remove an existing destination if we have something we can replace it with
@@ -514,11 +528,21 @@ impl RCmd for RCommandLine {
     }
 
     fn version(&self) -> Result<Version, VersionError> {
-        let output = Command::new(self.effective_r_command())
-            .arg("--version")
+        let (cmd, args) = self.effective_command();
+        log::debug!("version(): executing command: {} {} --version", cmd, args.join(" "));
+        let mut command = Command::new(&cmd);
+        for arg in &args {
+            command.arg(arg);
+        }
+        command.arg("--version");
+
+        let output = command
             .output()
-            .map_err(|e| VersionError {
-                source: VersionErrorKind::Io(e),
+            .map_err(|e| {
+                log::error!("Failed to execute command: {} - error: {}", cmd, e);
+                VersionError {
+                    source: VersionErrorKind::Io(e),
+                }
             })?;
 
         // R.bat on Windows will write to stderr rather than stdout for some reasons

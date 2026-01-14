@@ -254,6 +254,100 @@ pub fn check_installation_status(
     out
 }
 
+/// 系统依赖的安装可行性分类
+#[derive(Debug, Clone, PartialEq)]
+pub enum DependencyInstallability {
+    /// 可通过 conda 安装
+    CondaInstallable(String),  // conda 包名
+    /// 可通过系统包管理器安装
+    SystemInstallable,
+    /// 无法自动安装（需要手动处理）
+    ManualRequired,
+}
+
+/// 系统包名到 conda 包名的映射
+/// Returns None if the package cannot be installed via conda
+pub fn sys_to_conda_package(system_pkg: &str) -> Option<&'static str> {
+    match system_pkg {
+        // 开发库映射 - RedHat/CentOS 系
+        "libxml2-devel" => Some("libxml2"),
+        "libcurl-devel" => Some("libcurl"),
+        "zlib-devel" => Some("zlib"),
+        "openssl-devel" => Some("openssl"),
+        "fontconfig-devel" => Some("fontconfig"),
+        "freetype-devel" => Some("freetype"),
+        "libjpeg-turbo-devel" => Some("libjpeg-turbo"),
+        "libpng-devel" => Some("libpng"),
+        "libtiff-devel" => Some("libtiff"),
+        "fribidi-devel" => Some("fribidi"),
+        "harfbuzz-devel" => Some("harfbuzz"),
+        "libicu-devel" => Some("icu"),
+        "libwebp-devel" => Some("libwebp"),
+        "libX11-devel" => Some("libx11"),
+        "libXt-devel" => Some("libxt"),
+        "libXext-devel" => Some("libxext"),
+        "libXrender-devel" => Some("libxrender"),
+        "pcre2-devel" => Some("pcre2"),
+        "xz-devel" => Some("xz"),
+        "bzip2-devel" => Some("bzip2"),
+        "libffi-devel" => Some("libffi"),
+
+        // 开发库映射 - Debian/Ubuntu 系
+        "libxml2-dev" => Some("libxml2"),
+        "libcurl4-openssl-dev" => Some("libcurl"),
+        "libcurl4-gnutls-dev" => Some("libcurl"),
+        "zlib1g-dev" => Some("zlib"),
+        "libssl-dev" => Some("openssl"),
+        "libfontconfig1-dev" => Some("fontconfig"),
+        "libfreetype-dev" => Some("freetype"),
+        "libjpeg-dev" => Some("libjpeg-turbo"),
+        "libpng-dev" => Some("libpng"),
+        "libtiff-dev" => Some("libtiff"),
+        "libfribidi-dev" => Some("fribidi"),
+        "libharfbuzz-dev" => Some("harfbuzz"),
+        "libicu-dev" => Some("icu"),
+        "libwebp-dev" => Some("libwebp"),
+        "libx11-dev" | "libx11-6-dev" => Some("libx11"),
+        "libxt-dev" => Some("libxt"),
+        "libxext-dev" => Some("libxext"),
+        "libxrender-dev" => Some("libxrender"),
+        "libpcre2-dev" => Some("pcre2"),
+        "liblzma-dev" => Some("xz"),
+        "libbz2-dev" => Some("bzip2"),
+        "libffi-dev" => Some("libffi"),
+
+        // 工具映射
+        "pandoc" => Some("pandoc"),
+        "make" => Some("make"),
+        "cmake" => Some("cmake"),
+        "pkg-config" => Some("pkg-config"),
+        "gcc" => Some("gcc_linux-64"),  // conda-forge
+        "g++" => Some("gxx_linux-64"),  // conda-forge
+
+        // 无法通过 conda 安装的包或建议手动安装
+        "rustc" | "cargo" => None,
+        "texlive" | "texlive-full" => None,  // conda 有但安装太大，建议手动
+
+        // 未知包，返回 None
+        _ => None,
+    }
+}
+
+/// 判断系统依赖的安装可行性
+pub fn classify_dependency(
+    system_pkg: &str,
+    has_conda: bool,
+) -> DependencyInstallability {
+    if !has_conda {
+        return DependencyInstallability::SystemInstallable;
+    }
+
+    match sys_to_conda_package(system_pkg) {
+        Some(conda_pkg) => DependencyInstallability::CondaInstallable(conda_pkg.to_string()),
+        None => DependencyInstallability::ManualRequired,
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

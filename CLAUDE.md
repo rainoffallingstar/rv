@@ -31,6 +31,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Core Purpose
 **rv** is a fast, reproducible R package manager written in Rust that manages R dependencies through configuration files (`rproject.toml`), lock files (`rv.lock`), and project-specific package libraries.
 
+### Dual Crate Design
+The codebase is structured as both a library crate (for programmatic use) and a CLI binary:
+- **Library mode**: All core functionality is available as a Rust library
+- **CLI mode**: Enabled via the `cli` feature flag that adds CLI-specific dependencies
+- Always use `--features=cli` when building/testing the CLI
+- Feature gating affects parallel processing (`rayon` only available with CLI feature)
+
 ### Key Components
 
 **Configuration System** (`src/config.rs`)
@@ -67,11 +74,52 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - Position flags: `--first`, `--last`, `--before <alias>`, `--after <alias>`
   - Force source flag: `--force-source` to always build packages from source
 
+**Conda Integration** (`src/conda.rs`, `src/context.rs`)
+- Detects and uses micromamba > mamba > conda (prioritized by speed)
+- `CondaManager` handles environment creation and querying
+- `RCommandLookup` enum controls R version finding behavior:
+  - `Strict`: Requires R on system (for installation commands)
+  - `Soft(Version)`: For planning with `--r-version` flag
+  - `Skip`: For info commands where R isn't needed
+- When using conda, packages install to `{conda_env}/lib/R/library` instead of project-local library
+- Configuration via `conda_env` in `rproject.toml` or `--condaenv` CLI flag
+
+**Source-Based Dependencies** (`src/git/`, `src/sync/sources/`)
+- Git dependencies: GitHub URLs, SSH, with branch/tag/commit refs
+- Local dependencies: Path to local R packages
+- URL dependencies: Direct tarball URLs
+- Each source type has dedicated handler in `sources/` module
+
 ### Data Flow
 ```
 rproject.toml → Config → Resolver → Resolution → SyncHandler → Library
 Dependencies → Repositories → Cache → Lockfile → Staging → Installed Packages
 ```
+
+### Key Architectural Patterns
+
+**Untagged Enums for Flexible Configuration**
+- `ConfigDependency` enum uses `#[serde(untagged)]` to accept multiple dependency formats:
+  - Simple string: `"dplyr"`
+  - Git URL: `{ git = "https://github.com/..." }`
+  - Detailed spec: `{ name = "pkg", version = "1.0", ... }`
+- Allows user-friendly configuration while maintaining type safety
+
+**Repository Database Caching**
+- Package databases (PACKAGES files) cached locally with expiration
+- R-Universe uses custom API format, others use standard CRAN format
+- `load_databases()` uses parallel iteration with rayon (when cli feature enabled)
+
+**Resolution Algorithm**
+- Queue-based breadth-first resolution (`QueueItem` in resolver/mod.rs)
+- Multi-source priority: local → builtin → lockfile → repositories → git/url
+- SAT solver for conflict detection and version constraint satisfaction
+- Handles all R dependency types: depends, imports, suggests, enhances, linking_to
+
+**Source Handlers Pattern**
+- `sources/` module implements handlers for each package source type
+- Each handler implements consistent interface for downloading/preparing packages
+- Sources: Git repositories, local paths, remote repositories, URLs
 
 ### Key File Relationships
 - **`rproject.toml`**: Project configuration with dependencies
@@ -80,10 +128,18 @@ Dependencies → Repositories → Cache → Lockfile → Staging → Installed P
 - **Cache directories**: Persistent storage for downloads and metadata
 
 ### R Version Handling
-- Supports R version detection via `RCommandLine` 
+- Supports R version detection via `RCommandLine`
 - Library paths are namespaced by R version and architecture
 - Builtin package detection through R's installed.packages()
 - Uses R CMD INSTALL for package installation
+- Conda-managed R installations detected via `CondaManager`
+
+### Parallel Processing Architecture
+- **Database loading**: Parallel with `rayon` (CLI feature only) via `load_databases()`
+- **Package installation**: Worker pool pattern with `crossbeam` channels
+- **Max workers**: Determined by `num_cpus` but can be customized
+- **Staging**: Packages compiled in `rv/library/.staging/` before final installation
+- **Safety checks**: Uses `lsof` on Unix to prevent removing packages currently loaded in R sessions
 
 ### Testing Structure
 - Unit tests with `cargo test --features=cli`
@@ -103,15 +159,19 @@ Dependencies → Repositories → Cache → Lockfile → Staging → Installed P
 - Example projects in `example_projects/` demonstrating various use cases:
   - `simple/`, `multi-repo/`, `r-universe/`, `git-dep/`, `local-deps/`, etc.
   - Each with working `rproject.toml` configurations
+- **Integration tests**: `.github/scripts/integration.py` runs `rv sync` on all example projects in CI
+- **E2E tests**: `.github/scripts/e2e.py` runs end-to-end workflow tests
 
 ### Special Considerations
-- Requires R to be installed and accessible via PATH
+- Requires R to be installed and accessible via PATH (unless using conda)
 - Git CLI required for git-based dependencies
 - System dependency detection currently Ubuntu/Debian only
 - Windows support with R.bat fallback detection
 - Uses feature flag `cli` to separate library code from CLI binary
 - Parallel processing with `rayon` and `crossbeam` for efficient package operations
 - HTTP requests via `ureq` with platform certificate verification
+- **Conda environments**: Requires micromamba/mamba/conda for `--condaenv` feature
+- **Lockfile format**: Uses `bincode` (binary) not `rmp-serde` (MessagePack) as stated in old code
 
 ## Key Dependencies and Technologies
 
@@ -122,17 +182,18 @@ Dependencies → Repositories → Cache → Lockfile → Staging → Installed P
 - **url** (v2): URL handling and validation with serde support
 - **regex** (v1): Pattern matching for R version parsing
 - **ureq** (v3): HTTP client with platform-verifier for repository access
-- **crossbeam** (v0.8.4): Concurrent data structures
+- **crossbeam** (v0.8.4): Concurrent data structures and channels
 - **tempfile** (v3): Temporary file management
 - **fs-err** (v3): Enhanced filesystem operations with better error messages
-- **etcetera** (v0.10.0) / **cachedir** (v0.3): Cross-platform cache directory management
+- **etcetera** (v0.11.0): Cross-platform cache directory management (updated from v0.10.0)
+- **cachedir** (v0.3): XDG cache directory conformance
 - **os_info** (v3.9.1): OS name and version detection
-- **bincode** (v2): Binary serialization for package databases
+- **bincode** (v2): Binary serialization for package databases and lockfiles
 - **thiserror** (v2): Error type derivation
 - **walkdir** (v2): Recursive directory traversal
 - **reflink-copy** (v0.1): Copy-on-write file operations
 - **filetime** (v0.2.25): File timestamp manipulation
-- **flate2** (v1) / **tar** (v0.4) / **zip** (v4): Archive handling
+- **flate2** (v1) / **tar** (v0.4) / **zip** (v6): Archive handling
 - **sha2** (v0.10): SHA256 hashing
 - **num_cpus** (v1.16.0): CPU count detection
 - **indicatif** (v0.18): Progress bars (also in library code)
@@ -140,6 +201,7 @@ Dependencies → Repositories → Cache → Lockfile → Staging → Installed P
 - **which** (v8): Executable path resolution
 - **libc** (v0.2.172): System calls
 - **taplo** (v0.14.0): TOML formatting
+- **nix** (v0.30): Unix-specific fs operations (Linux target only)
 
 ### CLI-Specific Dependencies (feature = "cli")
 - **clap** (v4): Command-line argument parsing with derive
@@ -175,6 +237,14 @@ Dependencies → Repositories → Cache → Lockfile → Staging → Installed P
 - `src/library.rs` - Library path management
 - `src/project_summary.rs` - Project summary generation
 
+### Context and State Management
+- `src/context.rs` - Core `Context` struct containing all state for rv operations
+  - Manages config, cache, library, databases, lockfile, R command, conda env
+  - `RCommandLookup` enum: Controls when/how R version is detected
+  - `ResolveMode` enum: Default vs FullUpgrade (ignores lockfile)
+  - `load_databases()`: Parallel loading of package databases
+  - `resolve()`: Creates resolution based on current state
+
 ### Package Management
 - `src/package/` - Package-related functionality
   - `description.rs` - DESCRIPTION file parsing
@@ -197,13 +267,14 @@ Dependencies → Repositories → Cache → Lockfile → Staging → Installed P
 - `src/*/snapshots/` - Module-specific snapshot tests
 
 ### Other Important Files
-- `src/r_cmd.rs` - R command execution wrapper
-- `src/renv.rs` - renv integration support
-- `src/git/` - Git repository handling
+- `src/r_cmd.rs` - R command execution wrapper and version detection
+- `src/renv.rs` - renv lockfile import support
+- `src/git/` - Git repository handling (local, remote, URL parsing, reference types)
 - `src/http.rs` - HTTP client configuration
 - `src/consts.rs` - Global constants
-- `src/cancellation.rs` - Ctrl-C handling
+- `src/cancellation.rs` - Ctrl-C handling with termination support
 - `src/system_info.rs` / `src/system_req.rs` - System requirements detection
+- `src/conda.rs` - Conda environment detection and management
 
 ## Important Reminders
 
@@ -220,4 +291,7 @@ Dependencies → Repositories → Cache → Lockfile → Staging → Installed P
 - Use existing example projects in `example_projects/` as references for configurations
 - Repository order matters in `rproject.toml` (first repository has highest priority)
 - The `rv fmt` command requires rv to be installed (it formats rproject.toml files)
-- Project version is currently 0.13.0 (as defined in Cargo.toml)
+- Project version is currently 0.17.1 (as defined in Cargo.toml)
+- When working with conda integration, remember the detection priority: micromamba > mamba > conda
+- Parallel operations (database loading, package installation) only work with `cli` feature enabled
+- Lockfile uses `bincode` v2 format; breaking changes require bumping format version

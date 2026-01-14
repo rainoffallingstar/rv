@@ -16,6 +16,7 @@ const CONFIG_FILENAME: &str = "rproject.toml";
 const INITIAL_CONFIG: &str = r#"[project]
 name = "%project_name%"
 r_version = "%r_version%"
+%conda_env%
 
 # A list of repositories to fetch packages from. Order matters: we will try to get a package from each repository in order.
 # The alias is only used in this file if you want to specifically require a dependency to come from a certain repository.
@@ -46,6 +47,7 @@ pub fn init(
     r_version: &str,
     repositories: &[Repository],
     dependencies: &[String],
+    conda_env: Option<&str>,
     force: bool,
 ) -> Result<(), InitError> {
     let proj_dir = project_directory.as_ref();
@@ -64,7 +66,7 @@ pub fn init(
         .map(|x| x.to_string_lossy().to_string())
         .unwrap_or("my rv project".to_string());
 
-    let config = render_config(&project_name, r_version, repositories, dependencies);
+    let config = render_config(&project_name, r_version, repositories, dependencies, conda_env);
 
     write(proj_dir.join(CONFIG_FILENAME), config)?;
     Ok(())
@@ -75,7 +77,14 @@ fn render_config(
     r_version: &str,
     repositories: &[Repository],
     dependencies: &[String],
+    conda_env: Option<&str>,
 ) -> String {
+    let conda_section = if let Some(env) = conda_env {
+        format!(r#"conda_env = "{}""#, env)
+    } else {
+        String::new()
+    };
+
     let repos = repositories
         .iter()
         .map(|r| format!(r#"    {{alias = "{}", url = "{}"}},"#, r.alias, r.url()))
@@ -91,6 +100,7 @@ fn render_config(
     INITIAL_CONFIG
         .replace("%project_name%", project_name)
         .replace("%r_version%", r_version)
+        .replace("%conda_env%", &conda_section)
         .replace("%repositories%", &repos)
         .replace("%dependencies%", &deps)
 }
@@ -250,6 +260,7 @@ mod tests {
             &r_version.original,
             &repositories,
             &dependencies,
+            None,
             false,
         )
         .unwrap();

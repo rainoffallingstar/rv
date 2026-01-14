@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::conda::CondaManager;
 use crate::consts::{BASE_PACKAGES, NO_CHECK_OPEN_FILE_ENV_VAR_NAME, RECOMMENDED_PACKAGES};
 use crate::lockfile::Source;
 use crate::package::PackageType;
@@ -13,6 +14,7 @@ use crate::r_cmd::{InstallError, InstallErrorKind};
 use crate::sync::changes::SyncChange;
 use crate::sync::errors::{SyncError, SyncErrorKind, SyncErrors};
 use crate::sync::{LinkMode, sources};
+use crate::system_req::{self, SysInstallationStatus};
 use crate::utils::{get_max_workers, is_env_var_truthy};
 use crate::{
     BuildPlan, BuildStep, Cancellation, Context, GitExecutor, RCmd, ResolvedDependency,
@@ -505,6 +507,9 @@ impl<'a> SyncHandler<'a> {
             fs::create_dir_all(log_folder)?;
         }
 
+        // 确保系统依赖已安装
+        self.ensure_system_dependencies()?;
+
         // Then we mark the deps seen so they won't be installed into the staging dir
         for d in &deps_seen {
             // builtin packages will not be in the library
@@ -787,5 +792,157 @@ impl<'a> SyncHandler<'a> {
         });
 
         Ok(sync_changes)
+    }
+
+    /// 确保系统依赖已安装
+    fn ensure_system_dependencies(&self) -> Result<(), SyncError> {
+        // 收集所有需要的系统依赖
+        let all_sys_deps: HashSet<_> = self
+            .context
+            .system_dependencies
+            .values()
+            .flatten()
+            .map(|s| s.as_str())
+            .collect();
+
+        if all_sys_deps.is_empty() {
+            return Ok(());
+        }
+
+        log::info!("Checking {} system dependencies", all_sys_deps.len());
+
+        // 检查哪些依赖缺失
+        let missing_sys_deps = system_req::check_installation_status(
+            &self.context.cache.system_info,
+            &all_sys_deps,
+        );
+
+        let missing: Vec<_> = missing_sys_deps
+            .iter()
+            .filter(|(_, status)| {
+                matches!(status, SysInstallationStatus::Absent)
+            })
+            .map(|(pkg, _)| pkg.clone())
+            .collect();
+
+        if missing.is_empty() {
+            log::info!("All system dependencies are satisfied");
+            return Ok(());
+        }
+
+        // 根据是否使用 conda 选择安装策略
+        if self.context.conda_env.is_some() {
+            self.install_via_conda(&missing)?;
+        } else {
+            self.report_missing_system_deps(&missing);
+        }
+
+        Ok(())
+    }
+
+    /// 通过 conda 安装系统依赖
+    fn install_via_conda(&self, packages: &[String]) -> Result<(), SyncError> {
+        log::info!("Attempting to install {} dependencies via conda", packages.len());
+
+        // 分类依赖
+        let mut conda_installable = Vec::new();
+        let mut manual_required = Vec::new();
+
+        for pkg in packages {
+            match system_req::classify_dependency(pkg, true) {
+                system_req::DependencyInstallability::CondaInstallable(conda_pkg) => {
+                    conda_installable.push(conda_pkg);
+                }
+                system_req::DependencyInstallability::ManualRequired => {
+                    manual_required.push(pkg.clone());
+                }
+                _ => {
+                    manual_required.push(pkg.clone());
+                }
+            }
+        }
+
+        // 安装可通过 conda 安装的包
+        if !conda_installable.is_empty() {
+            let conda_manager = CondaManager::new()
+                .map_err(|e| {
+                    let io_err = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
+                    SyncError {
+                        source: SyncErrorKind::Io(io_err),
+                    }
+                })?;
+
+            conda_manager
+                .install_packages(
+                    self.context.conda_env.as_ref().unwrap().to_str().unwrap(),
+                    &conda_installable,
+                    None, // 使用默认频道
+                )
+                .map_err(|e| {
+                    let io_err = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
+                    SyncError {
+                        source: SyncErrorKind::Io(io_err),
+                    }
+                })?;
+
+            log::info!("Successfully installed conda packages: {:?}", conda_installable);
+        }
+
+        // 报告需要手动安装的包
+        if !manual_required.is_empty() {
+            self.report_manual_install_required(&manual_required);
+        }
+
+        Ok(())
+    }
+
+    /// 报告缺失的系统依赖（非 conda 模式）
+    fn report_missing_system_deps(&self, packages: &[String]) {
+        if packages.is_empty() {
+            return;
+        }
+
+        let system_info = &self.context.cache.system_info;
+        let (_distrib, _) = system_info.sysreq_data();
+
+        eprintln!("\n⚠️  Missing system dependencies detected:");
+        eprintln!("   Run 'rv sysdeps --only-absent' for details\n");
+
+        log::warn!(
+            "Missing {} system dependencies: {:?}",
+            packages.len(),
+            packages
+        );
+    }
+
+    /// 报告需要手动安装的包（conda 模式下无法安装的）
+    fn report_manual_install_required(&self, packages: &[String]) {
+        if packages.is_empty() {
+            return;
+        }
+
+        let system_info = &self.context.cache.system_info;
+        let (distrib, _) = system_info.sysreq_data();
+
+        eprintln!("\n⚠️  The following packages cannot be installed via conda:");
+
+        for pkg in packages {
+            eprintln!("   - {}", pkg);
+        }
+
+        // 根据系统给出安装建议
+        match distrib {
+            "ubuntu" | "debian" => {
+                eprintln!("\n   Install them using:");
+                eprintln!("   sudo apt-get install -y {}\n", packages.join(" "));
+            }
+            "centos" | "redhat" | "rockylinux" => {
+                eprintln!("\n   Install them using:");
+                eprintln!("   sudo yum install -y {}\n", packages.join(" "));
+            }
+            _ => {
+                eprintln!("\n   Please install them manually using your system package manager\n");
+            }
+        }
     }
 }
