@@ -319,30 +319,90 @@ fn try_main() -> Result<()> {
             let r_version = if let Some(r) = r_version {
                 r.original
             } else {
-                // if R version is not provided, get the major.minor of the R version on the path
-                let [major, minor] = match (RCommandLine {
-                    r: None,
-                    conda_env: None,
-                    conda_path: None,
-                })
-                .version()
-                {
-                    Ok(r_ver) => r_ver,
-                    Err(e) => {
-                        if cfg!(windows) {
-                            RCommandLine {
-                                r: Some(PathBuf::from("R.bat")),
+                // Try to detect R version from conda environment if specified
+                if let Some(ref env_name) = condaenv {
+                    // Check if environment exists
+                    match CondaManager::new() {
+                        Ok(conda_manager) => {
+                            if conda_manager.environment_exists(env_name) {
+                                // Environment exists, detect R version from it
+                                match (RCommandLine {
+                                    r: None,
+                                    conda_env: Some(env_name.clone()),
+                                    conda_path: None,
+                                })
+                                .version()
+                                {
+                                    Ok(r_ver) => {
+                                        let [major, minor] = r_ver.major_minor();
+                                        format!("{major}.{minor}")
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Warning: Failed to detect R version from conda environment '{}': {}. Using default R version 4.4.", env_name, e);
+                                        "4.4".to_string()
+                                    }
+                                }
+                            } else {
+                                // Environment doesn't exist, use default version
+                                eprintln!("Warning: Conda environment '{}' does not exist. Using default R version 4.4.", env_name);
+                                eprintln!("The environment will be created during 'rv sync --auto-create'.");
+                                "4.4".to_string()
+                            }
+                        }
+                        Err(_) => {
+                            // CondaManager initialization failed, try system R as fallback
+                            eprintln!("Warning: Could not initialize conda manager. Trying system R.");
+                            let [major, minor] = match (RCommandLine {
+                                r: None,
                                 conda_env: None,
                                 conda_path: None,
+                            })
+                            .version()
+                            {
+                                Ok(r_ver) => r_ver,
+                                Err(e) => {
+                                    if cfg!(windows) {
+                                        RCommandLine {
+                                            r: Some(PathBuf::from("R.bat")),
+                                            conda_env: None,
+                                            conda_path: None,
+                                        }
+                                        .version()?
+                                    } else {
+                                        Err(e)?
+                                    }
+                                }
                             }
-                            .version()?
-                        } else {
-                            Err(e)?
+                            .major_minor();
+                            format!("{major}.{minor}")
                         }
                     }
+                } else {
+                    // No conda environment specified, use system R
+                    let [major, minor] = match (RCommandLine {
+                        r: None,
+                        conda_env: None,
+                        conda_path: None,
+                    })
+                    .version()
+                    {
+                        Ok(r_ver) => r_ver,
+                        Err(e) => {
+                            if cfg!(windows) {
+                                RCommandLine {
+                                    r: Some(PathBuf::from("R.bat")),
+                                    conda_env: None,
+                                    conda_path: None,
+                                }
+                                .version()?
+                            } else {
+                                Err(e)?
+                            }
+                        }
+                    }
+                    .major_minor();
+                    format!("{major}.{minor}")
                 }
-                .major_minor();
-                format!("{major}.{minor}")
             };
 
             // Default to PPM repositories unless --no-repositories is specified
