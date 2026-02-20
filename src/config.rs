@@ -353,6 +353,9 @@ pub(crate) struct Project {
     /// Conda environment to use for R package installation
     #[serde(default)]
     conda_env: Option<String>,
+    /// Enable pak fallback when package installation fails
+    #[serde(default)]
+    pak_fallback: bool,
 }
 
 // That's the way to do it with serde :/
@@ -523,6 +526,10 @@ impl Config {
 
     pub fn set_conda_env(&mut self, conda_env: String) {
         self.project.conda_env = Some(conda_env);
+    }
+
+    pub fn pak_fallback(&self) -> bool {
+        self.project.pak_fallback
     }
 }
 

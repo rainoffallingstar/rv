@@ -67,14 +67,14 @@ impl From<io::Error> for SyncError {
 
 #[derive(Debug)]
 pub struct SyncErrors {
-    pub(crate) errors: Vec<(String, SyncError)>,
+    pub(crate) errors: Vec<(String, Option<String>, SyncError)>,  // (name, git_url, error)
 }
 
 impl fmt::Display for SyncErrors {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "Failed to install dependencies.")?;
 
-        for (dep, e) in &self.errors {
+        for (dep, _git_url, e) in &self.errors {
             write!(f, "\n    Failed to install {dep}:\n        {e}")?;
         }
 

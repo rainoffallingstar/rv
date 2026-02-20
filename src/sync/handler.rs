@@ -354,6 +354,10 @@ impl<'a> SyncHandler<'a> {
 
         let deps_by_name: HashMap<_, _> = deps.iter().map(|d| (d.name.as_ref(), d)).collect();
 
+        // Get base and recommended packages that should be preserved
+        let mut preserved_packages: Vec<&str> = RECOMMENDED_PACKAGES.to_vec();
+        preserved_packages.extend(BASE_PACKAGES.as_slice());
+
         for name in self.context.library.packages.keys() {
             if let Some(dep) = deps_by_name.get(name.as_str()) {
                 // If the library contains the dep, we also want it to be resolved from the lockfile, otherwise we cannot trust its source
@@ -377,6 +381,14 @@ impl<'a> SyncHandler<'a> {
                     continue;
                 }
             }
+
+            // Don't remove base/recommended packages that are not in dependencies
+            // These are part of the R installation and should be preserved
+            if preserved_packages.contains(&name.as_str()) {
+                log::debug!("Preserving system package: {}", name);
+                continue;
+            }
+
             deps_to_remove.insert((name.as_str(), true));
         }
 
@@ -739,9 +751,50 @@ impl<'a> SyncHandler<'a> {
 
         if has_errors.load(Ordering::Relaxed) {
             let mut err = errors.lock().unwrap();
+
+            // 提取 git URL 用于 pak 回滚
+            fn extract_git_url(source: &Source) -> Option<String> {
+                match source {
+                    Source::Git { git, .. } => Some(git.url().to_string()),
+                    Source::RUniverse { git, .. } => Some(git.url().to_string()),
+                    _ => None,
+                }
+            }
+
+            let failed_packages: Vec<(String, Option<String>)> = err.iter()
+                .map(|(d, _)| (d.name.to_string(), extract_git_url(&d.source)))
+                .collect();
+
+            // 如果启用了 pak 回滚，尝试使用 pak 安装失败的包
+            if self.context.config.pak_fallback() && !failed_packages.is_empty() {
+                log::info!("Trying pak fallback for {} failed packages", failed_packages.len());
+                let mut all_succeeded = true;
+
+                for (pkg_name, git_url) in &failed_packages {
+                    match self.try_pak_fallback(pkg_name, git_url.as_deref()) {
+                        Ok(_) => {
+                            log::info!("Successfully installed {} via pak", pkg_name);
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to install {} via pak: {:?}", pkg_name, e);
+                            all_succeeded = false;
+                        }
+                    }
+                }
+
+                if all_succeeded {
+                    // 所有包都通过 pak 安装成功，返回成功
+                    log::info!("All packages installed successfully via pak fallback");
+                    return Ok(Vec::new());
+                }
+            }
+
             let errors = std::mem::take(&mut *err)
                 .into_iter()
-                .map(|(d, e)| (d.name.to_string(), e))
+                .map(|(d, e)| {
+                    let git_url = extract_git_url(&d.source);
+                    (d.name.to_string(), git_url, e)
+                })
                 .collect();
             return Err(SyncError {
                 source: SyncErrorKind::SyncFailed(SyncErrors { errors }),
@@ -943,6 +996,113 @@ impl<'a> SyncHandler<'a> {
             _ => {
                 eprintln!("\n   Please install them manually using your system package manager\n");
             }
+        }
+    }
+
+    /// 尝试使用 pak 回滚安装失败的包
+    fn try_pak_fallback(&self, package_name: &str, git_url: Option<&str>) -> Result<(), SyncError> {
+        use std::process::Command;
+
+        log::info!("Attempting pak fallback for package: {} (git: {:?})", package_name, git_url);
+
+        let lib_path = self.context.library_path();
+
+        // 使用 RCommandLine 的字段来正确处理 conda 环境
+        let r_cmd = &self.context.r_cmd;
+
+        // 确定 conda 工具 (micromamba > mamba > conda)
+        let conda_tool = if let Some(ref path) = r_cmd.conda_path {
+            path.to_string_lossy().to_string()
+        } else {
+            "micromamba".to_string() // 默认使用 micromamba
+        };
+
+        // 构建命令
+        let (cmd, args) = if let Some(ref conda_env) = r_cmd.conda_env {
+            // 使用 conda run 执行 R
+            (conda_tool.clone(), vec!["run".to_string(), "-n".to_string(), conda_env.clone(), "R".to_string()])
+        } else {
+            // 直接使用 R
+            let r_exe = r_cmd.r.as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "R".to_string());
+            (r_exe, vec![])
+        };
+
+        // 首先确保 pak 已安装 - 检查 pak 是否可用
+        let check_pak_args = ["--vanilla", "-e", "packageVersion('pak')"];
+        let check_pak = Command::new(&cmd)
+            .args(&args)
+            .args(&check_pak_args)
+            .output();
+
+        if check_pak.is_err() || !check_pak.as_ref().unwrap().status.success() {
+            log::info!("Installing pak package first...");
+            // 设置 CRAN 镜像并安装 pak
+            let install_pak_args = [
+                "--vanilla", "-e",
+                "options(repos = c(CRAN = 'https://cloud.r-project.org')); install.packages('pak')"
+            ];
+            let install_pak = Command::new(&cmd)
+                .args(&args)
+                .args(&install_pak_args)
+                .output();
+
+            if install_pak.is_err() || !install_pak.as_ref().unwrap().status.success() {
+                let err_msg = if let Ok(output) = install_pak.as_ref() {
+                    String::from_utf8_lossy(&output.stderr).to_string()
+                } else {
+                    "Failed to execute R command".to_string()
+                };
+                log::error!("Failed to install pak package: {}", err_msg);
+                return Err(SyncError {
+                    source: SyncErrorKind::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to install pak package: {}", err_msg),
+                    )),
+                });
+            }
+        }
+
+        // 使用 pak 安装目标包 - 如果有 git_url，使用它；否则使用包名
+        let pak_cmd = if let Some(url) = git_url {
+            // 使用 GitHub URL 安装
+            format!(
+                "pak::pak('{}', lib = '{}')",
+                url,
+                lib_path.display()
+            )
+        } else {
+            // 使用包名
+            format!(
+                "pak::pak('{}', lib = '{}')",
+                package_name,
+                lib_path.display()
+            )
+        };
+
+        log::info!("Running pak: {} {}", cmd, args.join(" "));
+
+        let output = Command::new(&cmd)
+            .args(&args)
+            .args(["--vanilla", "-e", &pak_cmd])
+            .output()
+            .map_err(|e| SyncError {
+                source: SyncErrorKind::Io(e),
+            })?;
+
+        if output.status.success() {
+            log::info!("Successfully installed {} via pak fallback", package_name);
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::error!("pak fallback failed: {}", stderr);
+            Err(SyncError {
+                source: SyncErrorKind::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("pak fallback failed: {}", stderr),
+                )),
+            })
         }
     }
 }

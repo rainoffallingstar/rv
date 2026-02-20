@@ -139,11 +139,6 @@ impl Library {
             return;
         }
 
-        if self.custom {
-            log::debug!("Using custom library path. Ignoring library content.");
-            return;
-        }
-
         self.packages.clear();
         self.non_repo_packages.clear();
         self.broken.clear();
@@ -182,9 +177,8 @@ impl Library {
     }
 
     pub fn contains_package(&self, pkg: &ResolvedDependency) -> bool {
-        if self.custom
-            || (!self.packages.contains_key(pkg.name.as_ref())
-                && !matches!(pkg.source, Source::Builtin { .. }))
+        if !self.packages.contains_key(pkg.name.as_ref())
+            && !matches!(pkg.source, Source::Builtin { .. })
         {
             return false;
         }

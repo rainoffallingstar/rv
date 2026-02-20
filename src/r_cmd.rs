@@ -8,6 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use std::{fs, thread};
 
+use crate::conda::CondaManager;
 use crate::fs::copy_folder;
 use crate::sync::{LinkError, LinkMode};
 use crate::{Cancellation, Version};
@@ -259,8 +260,21 @@ impl RCommandLine {
                 log::debug!("Using conda_path: {}", path.display());
                 path.to_string_lossy().to_string()
             } else {
-                log::debug!("No conda_path set, falling back to 'conda' command");
-                "conda".to_string()
+                // Auto-detect the fastest available conda tool (micromamba > mamba > conda)
+                match CondaManager::detect_tool() {
+                    Ok(Some(tool)) => {
+                        log::debug!("Auto-detected package manager: {}", tool.command());
+                        tool.command().to_string()
+                    }
+                    Ok(None) => {
+                        log::debug!("No conda tool detected, falling back to 'conda'");
+                        "conda".to_string()
+                    }
+                    Err(e) => {
+                        log::debug!("Failed to detect conda tool: {}, falling back to 'conda'", e);
+                        "conda".to_string()
+                    }
+                }
             };
             log::debug!("effective_command: {} run -n {} R", conda_cmd, conda_env);
             (

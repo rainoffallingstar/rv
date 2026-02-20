@@ -8,21 +8,45 @@ use std::path::{Path, PathBuf};
 use fs_err as fs;
 #[cfg(feature = "cli")]
 use rayon::prelude::*;
+use serde::Deserialize;
 use url::Url;
 
 use crate::consts::{RUNIVERSE_PACKAGES_API_PATH, STAGING_DIR_NAME};
+
+#[derive(Deserialize)]
+struct Envs {
+    environments: Vec<CondaEnvInfo>,
+}
+
+#[derive(Deserialize)]
+struct CondaEnvInfo {
+    name: Option<String>,
+    prefix: PathBuf,
+}
 use crate::lockfile::Lockfile;
 use crate::package::Package;
 use crate::utils::create_spinner;
 use crate::{
-    Config, DiskCache, GitExecutor, Http, Library, RCommandLine, Repository, RepositoryDatabase,
+    Config, CondaManager, DiskCache, GitExecutor, Http, Library, RCommandLine, RCmd, Repository, RepositoryDatabase,
     Resolution, Resolver, SystemInfo, Version, find_r_version_command, get_package_file_urls, http,
     system_req,
 };
 
 /// Try to find the conda executable using multiple methods
+/// Priority: micromamba > mamba > conda (regardless of CONDA_EXE env var)
 fn find_conda_executable() -> Option<PathBuf> {
-    // First, check environment variables
+    // First, check for micromamba/mamba first (ignore CONDA_EXE which may point to slower conda)
+    // This ensures we use the fastest available tool
+    if let Ok(path) = which::which("micromamba") {
+        log::debug!("Found micromamba via which: {}", path.display());
+        return Some(path);
+    }
+    if let Ok(path) = which::which("mamba") {
+        log::debug!("Found mamba via which: {}", path.display());
+        return Some(path);
+    }
+
+    // Then check environment variables (only if micromamba/mamba not found)
     if let Ok(conda_exe) = env::var("CONDA_EXE") {
         let path = PathBuf::from(&conda_exe);
         if path.exists() {
@@ -31,34 +55,28 @@ fn find_conda_executable() -> Option<PathBuf> {
         }
     }
 
-    // Second, try which() for common conda commands
+    // Second, try which() for conda (last resort)
     if let Ok(path) = which::which("conda") {
         log::debug!("Found conda via which: {}", path.display());
         return Some(path);
     }
-    if let Ok(path) = which::which("mamba") {
-        log::debug!("Found mamba via which: {}", path.display());
-        return Some(path);
-    }
-    if let Ok(path) = which::which("micromamba") {
-        log::debug!("Found micromamba via which: {}", path.display());
-        return Some(path);
-    }
 
-    // Third, check common installation locations
+    // Third, check common installation locations (priority: micromamba > mamba > conda)
     let home = env::var("HOME").ok()?;
     let common_locations = vec![
+        // Micromamba (highest priority)
+        format!("{}/micromamba/bin/micromamba", home),
+        // Miniforge (includes mamba)
+        format!("{}/miniforge3/condabin/mamba", home),
+        format!("{}/miniforge3/bin/mamba", home),
+        format!("{}/miniforge3/condabin/conda", home),
+        format!("{}/miniforge3/bin/conda", home),
         // Miniconda
         format!("{}/miniconda3/condabin/conda", home),
         format!("{}/miniconda3/bin/conda", home),
         // Anaconda
         format!("{}/anaconda3/condabin/conda", home),
         format!("{}/anaconda3/bin/conda", home),
-        // Miniforge
-        format!("{}/miniforge3/condabin/conda", home),
-        format!("{}/miniforge3/bin/conda", home),
-        // Micromamba
-        format!("{}/micromamba/bin/micromamba", home),
     ];
 
     for location in common_locations {
@@ -151,20 +169,26 @@ impl Context {
         let mut r_version_found = true;
         let (r_version, r_cmd) = match r_command_lookup {
             RCommandLookup::Strict => {
-                let r_version = config.r_version().clone();
-                let r_cmd = if let Some(ref env_name) = conda_env_path {
-                    // If using conda, set up the conda_env
-                    // Try to find conda executable path using multiple methods
+                if let Some(ref env_name) = conda_env_path {
+                    // If using conda, detect the actual R version from the environment
                     let conda_path = find_conda_executable();
-                    RCommandLine {
+                    let r_cmd_line = RCommandLine {
                         conda_env: Some(env_name.to_string_lossy().to_string()),
                         r: None,
                         conda_path,
-                    }
+                    };
+                    // Try to detect actual R version from conda environment
+                    let actual_r_version = r_cmd_line.version().ok().map(|v| {
+                        let version_str = format!("{}.{}", v.major_minor()[0], v.major_minor()[1]);
+                        version_str.parse::<Version>().unwrap()
+                    });
+                    let r_version = actual_r_version.unwrap_or_else(|| config.r_version().clone());
+                    (r_version, r_cmd_line)
                 } else {
-                    find_r_version_command(&r_version)?
-                };
-                (r_version, r_cmd)
+                    let r_version = config.r_version().clone();
+                    let r_cmd = find_r_version_command(&r_version)?;
+                    (r_version, r_cmd)
+                }
             }
             RCommandLookup::Soft(v) => {
                 let r_cmd = match find_r_version_command(&v) {
@@ -174,7 +198,8 @@ impl Context {
                         RCommandLine::default()
                     }
                 };
-                (v, r_cmd)
+                let r_version = v.clone();
+                (r_version, r_cmd)
             }
             RCommandLookup::Skip => {
                 // Even when skipping R command lookup, we still need to respect conda_env configuration
@@ -225,8 +250,33 @@ impl Context {
         let library_path = if let Some(p) = config.library() {
             Some(p.clone())
         } else if let Some(ref conda_env) = conda_env_path {
+            // Resolve conda environment to actual path
+            let env_path = if let Ok(manager) = CondaManager::new() {
+                if let Ok(env) = manager.get_environment(conda_env.to_string_lossy().as_ref()) {
+                    env.prefix
+                } else {
+                    // Fallback: try to find environment using micromamba
+                    let output = std::process::Command::new("micromamba")
+                        .args(&["env", "list", "--json"])
+                        .output();
+                    let mut env_path = conda_env.clone();
+                    if let Ok(output) = output {
+                        if let Ok(Envs { environments }) = serde_json::from_str::<Envs>(&String::from_utf8_lossy(&output.stdout)) {
+                            for env in environments {
+                                if env.name.as_deref() == Some(conda_env.to_string_lossy().as_ref()) || env.prefix.file_name().map(|n| n.to_string_lossy() == conda_env.to_string_lossy()).unwrap_or(false) {
+                                    env_path = env.prefix;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    env_path
+                }
+            } else {
+                conda_env.clone()
+            };
             // Use the conda environment's R library path
-            let lib_path = PathBuf::from(format!("{}/lib/R/library", conda_env.display()));
+            let lib_path = env_path.join("lib/R/library");
             log::debug!(
                 "Using conda environment library path: {}",
                 lib_path.display()
